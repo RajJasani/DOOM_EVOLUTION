@@ -127,7 +127,14 @@ def main() -> None:
     enemy_emb = model.enemy_attention(ent_feats_t, ent_type_t, ent_mask_t, context_query=vitals_emb)
     print(f"    - EnemyAttentionModule output: {tuple(enemy_emb.shape)}")
 
-    fused_emb = model.fusion(vitals_emb, ray_emb, enemy_emb)
+    memory_t = batched_obs.get("memory_features", torch.zeros(4, 64, device=model.device))
+    if memory_t.ndim == 3:
+        memory_t = memory_t[:, 0]
+    memory_emb = model.memory_encoder(memory_t) if model.memory_encoder is not None else None
+    if memory_emb is not None:
+        print(f"    - MemoryEncoder output:        {tuple(memory_emb.shape)}")
+
+    fused_emb = model.fusion(vitals_emb, ray_emb, enemy_emb, memory_emb=memory_emb)
     print(f"    - FeatureFusion output:        {tuple(fused_emb.shape)}")
 
     print("\n" + "=" * 75)

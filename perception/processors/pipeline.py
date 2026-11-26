@@ -104,7 +104,7 @@ class ProcessedObservation:
     """
 
     rays:          RayFeatures
-    depth:         DepthFeatures
+    depth:         Optional[DepthFeatures]
     entities:      EntityFeatures
     vitals:        VitalsFeatures
 
@@ -156,14 +156,16 @@ class SensoryPipeline:
         low_health_threshold:      float           = 25.0,
         critical_health_threshold: float           = 10.0,
         validate:                  bool            = True,
+        enable_depth:              bool            = True,
     ) -> None:
         self._visual_encoder = visual_encoder
         self._device         = device
         self._validate       = validate
+        self._enable_depth   = enable_depth
 
         # Instantiate all processors once; they are stateless
         self._ray_proc    = RaycastProcessor(open_threshold=open_threshold)
-        self._depth_proc  = DepthProcessor()
+        self._depth_proc  = DepthProcessor() if enable_depth else None
         self._entity_proc = EntityProcessor()
         self._vitals_proc = VitalsProcessor(
             low_health_threshold=low_health_threshold,
@@ -188,9 +190,9 @@ class SensoryPipeline:
         # --- Validation (optional, non-fatal) ---------------------------
         is_valid, issues = self._run_validation(obs)
 
-        # --- Run all four processors ------------------------------------
+        # --- Run processors (skipping depth when disabled to save CPU) ---
         rays_feat    = self._ray_proc.process(obs)
-        depth_feat   = self._depth_proc.process(obs)
+        depth_feat   = self._depth_proc.process(obs) if (self._enable_depth and self._depth_proc is not None) else None
         entity_feat  = self._entity_proc.process(obs)
         vitals_feat  = self._vitals_proc.process(obs)
 

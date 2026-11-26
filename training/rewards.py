@@ -36,30 +36,45 @@ class DoomRewardShaper:
 
         self.last_keys = 0
         self.last_health = 100.0
+        self.is_normalized = False
 
     def reset(self, initial_obs: Mapping[str, Any]) -> None:
         """Reset internal trackers at episode start."""
         vitals = initial_obs["vitals"]
-        self.last_health = float(vitals[0])
+        raw_health = float(vitals[0])
+        self.is_normalized = bool(raw_health <= 2.0)
+        self.last_health = raw_health * 100.0 if self.is_normalized else raw_health
         self.last_keys = int(np.sum(vitals[8:14]))
 
     def compute_reward(
         self,
         obs: Mapping[str, Any],
-        raw_env_reward: float,
-        terminated: bool,
-        truncated: bool,
+        raw_env_reward: float = 0.0,
+        terminated: bool = False,
+        truncated: bool = False,
+        env_reward: float | None = None,
+        **kwargs: Any,
     ) -> float:
-        """Calculate shaped reward combining milestones, survival, and exploration."""
+        """Calculate shaped reward combining milestones, survival, and exploration.
+
+        Supports both positional and keyword invocations ('env_reward' or 'raw_env_reward').
+        Invariant to whether obs contains raw or pre-normalized vitals.
+        """
+        effective_reward = env_reward if env_reward is not None else raw_env_reward
+
         vitals = obs["vitals"]
-        curr_health = float(vitals[0])
+        raw_health = float(vitals[0])
         curr_keys = int(np.sum(vitals[8:14]))
 
-        shaped_reward = raw_env_reward
+        # Detect scale: if health is normalized (<= 2.0) or tracked as normalized, scale to canonical HP (0..100)
+        is_norm = getattr(self, "is_normalized", False) or (raw_health <= 2.0)
+        curr_health = raw_health * 100.0 if is_norm else raw_health
+
+        shaped_reward = effective_reward
 
         # Milestone: exit reached vs death
         if terminated:
-            if raw_env_reward > 0:
+            if effective_reward > 0:
                 shaped_reward += self.exit_bonus
             elif curr_health <= 0:
                 shaped_reward += self.death_penalty
@@ -69,15 +84,16 @@ class DoomRewardShaper:
             shaped_reward += self.keycard_bonus * (curr_keys - self.last_keys)
             self.last_keys = curr_keys
 
-        # Damage taken
+        # Damage taken (measured in true HP delta)
         if curr_health < self.last_health:
             damage = self.last_health - curr_health
             shaped_reward += self.damage_taken_penalty * damage
         self.last_health = curr_health
 
-        # Small velocity/exploration incentive
-        forward_vel = float(vitals[14])
+        # Small velocity/exploration incentive (measured in map units/tic)
+        raw_vel = float(vitals[14])
+        forward_vel = raw_vel * 20.0 if abs(raw_vel) <= 2.0 else raw_vel
         if abs(forward_vel) > 1.0:
             shaped_reward += self.exploration_step_bonus
 
-        return shaped_reward
+        return float(shaped_reward)

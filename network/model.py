@@ -12,7 +12,7 @@ import torch
 import torch.nn as nn
 
 from .config import NetworkConfig
-from .encoder import FeatureFusion, RaycastEncoder, VitalsEncoder
+from .encoder import FeatureFusion, MemoryEncoder, RaycastEncoder, VitalsEncoder
 from .enemy_attention import EnemyAttentionModule
 from .memory import RecurrentMemory
 from .policy import PolicyHead, ValueHead
@@ -57,6 +57,7 @@ class DoomNetwork(nn.Module):
         self.vitals_encoder = VitalsEncoder(self.config)
         self.ray_encoder = RaycastEncoder(self.config)
         self.enemy_attention = EnemyAttentionModule(self.config)
+        self.memory_encoder = MemoryEncoder(self.config) if self.config.memory_feature_dim > 0 else None
         self.fusion = FeatureFusion(self.config)
 
         # 2. Recurrent Memory
@@ -85,7 +86,18 @@ class DoomNetwork(nn.Module):
         else:
             raise TypeError(f"Cannot convert {type(val)} to tensor.")
 
-    def _extract_inputs(self, obs: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    def _extract_inputs(
+        self, obs: Mapping[str, Any]
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor | None,
+        torch.Tensor | None,
+    ]:
         """Extract and prepare all required observation tensors.
 
         Normalizes unbatched observation inputs by prepending a batch dimension (B=1)
@@ -106,6 +118,20 @@ class DoomNetwork(nn.Module):
         ent_type = self._prepare_tensor(entities["entity_type"], dtype=torch.long)
         ent_mask = self._prepare_tensor(entities["mask"], dtype=torch.float32)
 
+        # Optional spatial memory features (Member 2 PerceptionBridge interface)
+        memory = None
+        if self.config.memory_feature_dim > 0:
+            if "memory_features" in obs and obs["memory_features"] is not None:
+                memory = self._prepare_tensor(obs["memory_features"], dtype=torch.float32)
+            else:
+                # Backward-compatible fallback: zeros tensor matching batch prefix
+                memory = torch.zeros(
+                    *vitals.shape[:-1],
+                    self.config.memory_feature_dim,
+                    dtype=torch.float32,
+                    device=self.device,
+                )
+
         # Optional visual embedding (Member 2 perception interface)
         visual = None
         if "visual_embedding" in obs and self.config.visual_feature_dim > 0:
@@ -124,10 +150,12 @@ class DoomNetwork(nn.Module):
             ent_type = ent_type.unsqueeze(0)
         if ent_mask.ndim == 1:
             ent_mask = ent_mask.unsqueeze(0)
+        if memory is not None and memory.ndim == 1:
+            memory = memory.unsqueeze(0)
         if visual is not None and visual.ndim in (1, 3):
             visual = visual.unsqueeze(0)
 
-        return vitals, ray_dist, ray_hit, ent_feats, ent_type, ent_mask, visual
+        return vitals, ray_dist, ray_hit, ent_feats, ent_type, ent_mask, memory, visual
 
     def encode_observation(self, obs: Mapping[str, Any]) -> torch.Tensor:
         """Run feature encoders and fusion to produce unified latent embeddings.
@@ -135,7 +163,7 @@ class DoomNetwork(nn.Module):
         Returns:
             Tensor of shape (..., fusion_hidden_dim)
         """
-        vitals, ray_dist, ray_hit, ent_feats, ent_type, ent_mask, visual = self._extract_inputs(obs)
+        vitals, ray_dist, ray_hit, ent_feats, ent_type, ent_mask, memory, visual = self._extract_inputs(obs)
 
         vitals_emb = self.vitals_encoder(vitals)
         ray_emb = self.ray_encoder(ray_dist, ray_hit)
@@ -145,11 +173,17 @@ class DoomNetwork(nn.Module):
             mask=ent_mask,
             context_query=vitals_emb,
         )
+        memory_emb = (
+            self.memory_encoder(memory)
+            if self.memory_encoder is not None and memory is not None
+            else None
+        )
 
         fused = self.fusion(
             vitals_emb=vitals_emb,
             ray_emb=ray_emb,
             enemy_emb=enemy_emb,
+            memory_emb=memory_emb,
             visual_emb=visual,
         )
         return fused

@@ -16,6 +16,15 @@ class NetworkConfig:
     # ----------------- Observation Space Dimensions (from CONTRACT.md) -----------------
     # Vitals: 17 scalar features (health, armor, weapons, ammo, keys, velocities)
     vitals_dim: int = 17
+    # Canonical vitals normalization: False by default because canonical perception pipeline
+    # (PerceptionBridge / SensoryPipeline / VitalsProcessor) normalizes vitals to [0, 1] before network input.
+    # Set to True if feeding raw unnormalized vitals directly into DoomNetwork.
+    normalize_vitals: bool = False
+
+    # Spatial Memory Features (Member 2 PerceptionBridge interface)
+    # 64-dimensional egocentric spatial memory vector (doors, keys, threats, direction coverage)
+    memory_feature_dim: int = 64
+    memory_hidden_dim: int = 64
 
     # Rays: 64 rays across 360 degrees
     num_rays: int = 64

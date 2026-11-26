@@ -132,8 +132,9 @@ class PerceptionBridge:
         pipeline:        Optional[SensoryPipeline]         = None,
         memory:          Optional[EgocentricSpatialMemory] = None,
         warn_on_invalid: bool                              = True,
+        enable_depth:    bool                              = False,
     ) -> None:
-        self._pipeline:        SensoryPipeline         = pipeline or SensoryPipeline()
+        self._pipeline:        SensoryPipeline         = pipeline or SensoryPipeline(enable_depth=enable_depth)
         self._memory:          EgocentricSpatialMemory = memory   or EgocentricSpatialMemory()
         self._warn_on_invalid: bool                    = warn_on_invalid
         self._episode_step:    int                     = 0

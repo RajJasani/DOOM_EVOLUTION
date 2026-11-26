@@ -4,7 +4,7 @@ Exposes DoomNetwork, NetworkConfig, submodules, and output containers.
 """
 
 from .config import NetworkConfig
-from .encoder import FeatureFusion, RaycastEncoder, VitalsEncoder
+from .encoder import FeatureFusion, MemoryEncoder, RaycastEncoder, VitalsEncoder
 from .enemy_attention import EnemyAttentionModule
 from .memory import RecurrentMemory
 from .model import DoomNetwork, EvaluationResult, StepResult
@@ -14,6 +14,7 @@ __all__ = [
     "NetworkConfig",
     "VitalsEncoder",
     "RaycastEncoder",
+    "MemoryEncoder",
     "EnemyAttentionModule",
     "FeatureFusion",
     "RecurrentMemory",

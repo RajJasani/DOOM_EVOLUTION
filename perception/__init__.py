@@ -50,6 +50,7 @@ from .spatial_memory import (
     DirectionExplorationTracker,
 )
 from .bridge import PerceptionBridge, BridgeStats, MEMORY_KEY
+from .adapter import ObservationAdapter, VectorObservationAdapter
 
 __all__ = [
     # Member 1 spatial reasoning
@@ -75,8 +76,10 @@ __all__ = [
     "KeyCardTracker",
     "MemorySnapshot",
     "DirectionExplorationTracker",
-    # Integration bridge (Phase 4)
+    # Integration bridge & adapters (Phase 4)
     "PerceptionBridge",
     "BridgeStats",
     "MEMORY_KEY",
+    "ObservationAdapter",
+    "VectorObservationAdapter",
 ]

@@ -23,6 +23,8 @@ import numpy as np
 
 # Member 2: perception integration
 from perception.bridge import PerceptionBridge, MEMORY_KEY
+from perception.adapter import ObservationAdapter
+from perception.action_adapter import ActionEdgeTriggerAdapter
 
 SUBMISSION_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SUBMISSION_DIR.parent
@@ -55,8 +57,10 @@ class DoomAgent:
         self.hx = None
         self.model = None
 
-        # Member 2: Sensory pipeline & spatial memory
-        self.bridge = PerceptionBridge()
+        # Member 2: Sensory pipeline & spatial memory (ObservationAdapter canonical pipeline)
+        self.adapter = ObservationAdapter(enable_depth=False)
+        self.bridge = self.adapter.bridge
+        self.action_adapter = ActionEdgeTriggerAdapter(enabled=False)
 
         # Telemetry & fallback tracking
         self._total_steps = 0
@@ -72,6 +76,8 @@ class DoomAgent:
         self.hx = None
         if self.bridge is not None:
             self.bridge.reset()
+        if self.action_adapter is not None:
+            self.action_adapter.reset()
         self._n_perception_fallbacks = 0
         self._n_network_fallbacks = 0
         self._last_error = None
@@ -107,6 +113,8 @@ class DoomAgent:
                         hx=self.hx,
                         deterministic=True,
                     )
+                if self.action_adapter is not None:
+                    action_np = self.action_adapter.process(action_np)
                 return action_np.astype(np.int8)
             except Exception as exc:
                 self._n_network_fallbacks += 1

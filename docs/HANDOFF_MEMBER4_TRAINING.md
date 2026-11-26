@@ -7,51 +7,133 @@
 
 ---
 
-## 1. Current Implementation Status
+## 1. Integrated Architecture Overview & Pre-Flight Status
 
-- **Environment Wrapper Verified:** `doom_env.make_env(wad_path, map_name, episode_ticks=2100)` is verified and operational.
-- **Reward Shaping Foundation Created:** `training/rewards.py` implements `DoomRewardShaper`:
-  - Milestone bonus (+10.0 for reaching exit).
-  - Combat survival (+1.0 per enemy kill, -2.0 on death).
-  - Keycard progression (+3.0 per keycard picked up).
-  - Health preservation (-0.05 per damage point taken).
-  - Anti-camping / exploration incentive (+0.02 when moving).
-- **Network Interface Ready:** `network.DoomNetwork` exposes `step()` for rollout collection and `evaluate_actions()` for PPO loss computation.
+Following the Phase 1–6 Integration Repairs, the perception, recurrent neural network, and agent submission modules are fully unified.
+
+Key integration characteristics:
+- **Observation Pipeline Parity:** Identical preprocessing via `ObservationAdapter` (inference) and `VectorObservationAdapter` (training).
+- **Canonical Vitals Normalization:** Normalization occurs strictly once inside the perception pipeline. `NetworkConfig.normalize_vitals` is set to `False` by default so `DoomNetwork` does not double-normalize.
+- **Spatial Memory Integration:** Member 2's `memory_features` (64-dim egocentric spatial memory) are connected to Member 3's `DoomNetwork` via `MemoryEncoder` (64 $\to$ 64 MLP) and fused in `FeatureFusion` (320 $\to$ 256).
+- **Depth Processing Configurable:** `enable_depth=False` by default in adapters and agent inference, saving significant CPU overhead during high-throughput rollouts.
+- **Reward Shaper Verified:** `DoomRewardShaper` supports both positional and keyword invocations (`env_reward` or `raw_env_reward`) and correctly handles health damage penalties in true HP units across raw or normalized vitals.
 
 ---
 
-## 2. Core Technical Requirements for Member 4
+## 2. Observation Pipeline for Parallel Training Rollouts
 
-### 2.1 Rollout Collection Loop (`training/rollout.py`)
-Collect transitions across $N$ parallel environments or sequential episodes:
-- **Per Step:**
-  ```python
-  step_res = model.step(obs, hx=hx, deterministic=False)
-  action_np = step_res.action.cpu().numpy().astype(np.int8)
-  next_obs, env_reward, terminated, truncated, info = env.step(action_np)
-  done = terminated or truncated
+Do not pass raw ViZDoom observation dictionaries directly to `DoomNetwork`. Use the canonical `VectorObservationAdapter`.
 
-  shaped_reward = reward_shaper.compute_reward(next_obs, env_reward, terminated, truncated)
-  
-  # Store in rollout buffer:
-  # obs, action, shaped_reward, value, log_prob, done, hx
-  
-  obs = next_obs
-  hx = step_res.hx if not done else model.init_hidden(batch_size=1, device=device)
-  ```
+### 2.1 Multi-Environment Rollout Setup
 
-### 2.2 Generalized Advantage Estimation (GAE)
+```python
+from perception import VectorObservationAdapter
+from network import DoomNetwork, NetworkConfig
+
+num_envs = 8
+device = "cuda" if torch.cuda.is_available() else "cpu"
+
+# 1. Initialize vectorized adapter (depth disabled by default to save CPU)
+adapter = VectorObservationAdapter(num_envs=num_envs, enable_depth=False)
+model = DoomNetwork(NetworkConfig()).to(device)
+
+# 2. Reset environments and adapter slots
+raw_obs_list = [envs[i].reset()[0] for i in range(num_envs)]
+for i in range(num_envs):
+    adapter.reset_env(i)
+
+# 3. Process observations through adapter
+processed_obs_list = adapter.process_batch(raw_obs_list)
+
+# 4. Collate into batched PyTorch tensors for DoomNetwork
+batched_tensors = adapter.collate_for_network(processed_obs_list, device=device)
+```
+
+### 2.2 Per-Environment Episode Termination
+
+When environment $i$ terminates or truncates:
+1. Reset the environment: `raw_obs_list[i] = envs[i].reset()[0]`
+2. Reset that specific environment's spatial memory slot: `adapter.reset_env(i)`
+3. Reset that environment's recurrent hidden state: `hx[:, i, :] = 0.0`
+
+---
+
+## 3. Observation Dictionary Schema & Tensor Shapes
+
+When collated via `adapter.collate_for_network()`, the observation dictionary has the following layout:
+
+| Key | Nested Key | Type / Dtype | Batch Shape `(B, ...)` | Sequential Shape `(B, T, ...)` | Semantics & Range |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| `vitals` | — | `torch.float32` | `(B, 17)` | `(B, T, 17)` | Pre-normalized: Health `[0, 1]`, Armor `[0, 1]`, Weapons `[0, 1]`, Ammo `[0, 1]`, Velocity `[-1, 1]`. |
+| `rays` | `distance` | `torch.float32` | `(B, 64)` | `(B, T, 64)` | Normalized distance to nearest hit in `[0.0, 1.0]`. |
+| `rays` | `hit_type` | `torch.int64` | `(B, 64)` | `(B, T, 64)` | Surface type enum: 0=None, 1=Wall, 2=Door, 3=Enemy, 4=Pickup, 5=Obstacle. |
+| `visible_entities` | `features` | `torch.float32` | `(B, 32, 5)` | `(B, T, 32, 5)` | Normalized `[dist, sin(yaw), cos(yaw), pitch, relative_vel]`. |
+| `visible_entities` | `entity_type` | `torch.int64` | `(B, 32)` | `(B, T, 32)` | Entity category enum: 0..8 (Player, Shotgunner, Imp, etc.). |
+| `visible_entities` | `mask` | `torch.float32` | `(B, 32)` | `(B, T, 32)` | 1.0 for valid detected entity slot, 0.0 for padding. |
+| `memory_features` | — | `torch.float32` | `(B, 64)` | `(B, T, 64)` | Egocentric decay-weighted spatial memory vector (doors, enemies, pickups, breadcrumbs). |
+
+---
+
+## 4. Recurrent PPO Training Loop (`training/`)
+
+### 4.1 Rollout Step (`training/rollout.py`)
+
+```python
+with torch.no_grad():
+    step_res = model.step(batched_tensors, hx=hx, deterministic=False)
+
+actions_np = step_res.action.cpu().numpy().astype(np.int8)  # Shape (B, 9)
+values = step_res.value  # Shape (B, 1)
+log_probs = step_res.log_prob  # Shape (B,)
+next_hx = step_res.hx  # Shape (1, B, 256)
+
+# Step vectorized environments
+for i in range(num_envs):
+    next_raw_obs, env_reward, term, trunc, info = envs[i].step(actions_np[i])
+    done = term or trunc
+    
+    shaped_reward = reward_shaper[i].compute_reward(
+        obs=processed_obs_list[i],
+        env_reward=env_reward,
+        terminated=term,
+        truncated=trunc,
+    )
+    
+    # Store transition in buffer:
+    # obs[i], actions[i], shaped_reward, values[i], log_probs[i], done, hx[:, i:i+1, :]
+    
+    if done:
+        next_raw_obs = envs[i].reset()[0]
+        adapter.reset_env(i)
+        reward_shaper[i].reset(processed_obs_list[i])
+        next_hx[:, i, :] = 0.0
+        
+    raw_obs_list[i] = next_raw_obs
+    
+hx = next_hx
+```
+
+### 4.2 Generalized Advantage Estimation (GAE)
 Compute advantages across the rollout horizon $T$:
 $$\delta_t = r_t + \gamma V(s_{t+1})(1 - d_t) - V(s_t)$$
 $$A_t = \delta_t + (\gamma \lambda) (1 - d_t) A_{t+1}$$
 $$\hat{R}_t = A_t + V(s_t)$$
-Use $\gamma = 0.99$ and $\lambda = 0.95$. Normalize advantages across the mini-batch:
+Recommended hyperparameters: $\gamma = 0.99$, $\lambda = 0.95$. Normalize advantages across the mini-batch:
 $$A_{\text{norm}} = \frac{A - \mu_A}{\sigma_A + 10^{-8}}$$
 
-### 2.3 Recurrent PPO Loss Calculation (`training/ppo.py`)
+### 4.3 Recurrent Mini-Batch Loss (`training/ppo.py`)
 Chunk rollout trajectories into sequence segments of length $L$ (e.g., $L = 16$ or $32$ steps) to perform truncated Backpropagation Through Time (BPTT):
+
 ```python
-eval_res = model.evaluate_actions(obs_chunk, hx_start, actions_chunk, dones_chunk)
+# seq_obs is a dict of tensors with shapes (B_sub, L, ...)
+# actions_chunk shape (B_sub, L, 9)
+# dones_chunk shape (B_sub, L) -> used by model to reset GRU state mid-sequence
+eval_res = model.evaluate_actions(
+    obs=seq_obs,
+    hx=hx_start,  # Shape (1, B_sub, 256)
+    actions=actions_chunk,
+    dones=dones_chunk,
+)
 
 # 1. Clipped Surrogate Policy Loss
 ratio = torch.exp(eval_res.log_probs - old_log_probs)
@@ -78,26 +160,39 @@ optimizer.step()
 
 ---
 
-## 3. Training Curriculum & Milestone Targets
+## 5. Action Space & Edge Triggering
 
-Design `training/train.py` to progress through the competition map categories:
+The action space is strictly `MultiBinary(9)`:
+`[ATTACK, SPEED, STRAFE, MOVE_R, MOVE_L, TURN_R, TURN_L, USE, SELECT_NEXT_WEAPON]`
+
+- **Policy Distribution:** Independent Bernoulli distributions per button.
+- **Continuous Button Presses:** In ViZDoom, buttons like `USE` (index 7) or `SELECT_NEXT_WEAPON` (index 8) can stall if held down continuously across multiple consecutive tics.
+- **ActionEdgeTriggerAdapter:** Located in `perception.action_adapter.ActionEdgeTriggerAdapter`.
+  - In `submission/agent.py`, it is instantiated with `enabled=False` by default to preserve the exact raw network output.
+  - If your trained policy exhibits weapon toggling or door stuckness due to holding buttons, you can safely enable `ActionEdgeTriggerAdapter(enabled=True)` in inference or during evaluation.
+
+---
+
+## 6. Training Curriculum & Milestone Targets
+
+Progress through map curricula:
 
 | Stage | Objective | Primary Reward Drivers | Map Types |
 | :---: | :--- | :--- | :--- |
-| **Stage 1: Combat & Survival** | Aiming, shooting, dodging projectiles, weapon management. | Kill bonus, damage penalty avoidance, health preservation. | Small arenas with Shotgun Guy / Imp spawns. |
-| **Stage 2: Multi-Room Navigation** | Hallway traversal, clearing dead ends, opening doors. | Forward exploration bonus, door opening incentive. | `two_rooms.wad` and multi-room layouts. |
+| **Stage 1: Combat & Survival** | Aiming, shooting, dodging projectiles, weapon management. | Kill bonus (+1.0), damage penalty avoidance (-0.05/HP), death penalty (-2.0). | Small arenas with Shotgun Guy / Imp spawns. |
+| **Stage 2: Multi-Room Navigation** | Hallway traversal, clearing dead ends, opening doors. | Forward exploration bonus (+0.02), door opening incentive. | `two_rooms.wad` and multi-room layouts. |
 | **Stage 3: Progression & Keys** | Picking up keycards, remembering locked door locations, backtracking. | Keycard pickup (+3.0), locked door resolution. | Locked-door WADs requiring Blue/Yellow/Red keys. |
 | **Stage 4: Exit Completion** | Navigating gauntlet from start to exit switch. | Exit milestone completion (+10.0). | Full multi-stage levels. |
 
 ---
 
-## 4. Checkpoint Delivery Requirements
+## 7. Checkpoint Delivery Requirements
 
 1. **Target File Path:** `submission/weights/model.pt`
 2. **Contents:** `model.state_dict()` (strictly matching `DoomNetwork` keys and tensor shapes).
 3. **Format & Tracking:**
    - Saved with standard `torch.save(model.state_dict(), "submission/weights/model.pt")`.
-   - Tracked via **Git LFS** (`git lfs track "*.pt"`).
-   - Checkpoint size must remain **< 10 MB** (limit for submission is 1 GB total).
-4. **Validation Test:**
-   - After saving, run `python validate.py` to ensure the agent loads the weights and successfully executes full episodes without crashes.
+   - Checkpoint size: ~4.6 MB (well under the 1 GB repository submission limit).
+4. **Verification Step:**
+   - Run `python validate.py` from repository root.
+   - Run `python examples/forward_pass_example.py` to confirm inference.
