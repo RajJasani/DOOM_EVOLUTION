@@ -1,6 +1,15 @@
 """Evaluation entry point. The scorer instantiates DoomAgent from this file.
 
 Contract: docs/CONTRACT.md §6.
+
+Integrated Architecture (Members 1, 2, and 3):
+----------------------------------------------
+Member 1: System architecture, DoomAgent evaluation interface, weight loading, error handling.
+Member 2: Sensory pipeline, raycast/vitals/entity preprocessing, spatial memory (PerceptionBridge).
+Member 3: PyTorch neural network (DoomNetwork) with circular 1D-CNN, enemy attention, GRU memory, actor-critic heads.
+
+Pipeline:
+  Raw Obs -> PerceptionBridge.process() -> Enriched Obs -> DoomNetwork.get_action() -> 9-bit MultiBinary Action
 """
 
 from __future__ import annotations
@@ -8,7 +17,14 @@ from __future__ import annotations
 import logging
 from pathlib import Path
 import sys
+from typing import Any, Optional
+
 import numpy as np
+
+# Member 2: perception integration
+from perception.bridge import PerceptionBridge, MEMORY_KEY
+from perception.adapter import ObservationAdapter
+from perception.action_adapter import ActionEdgeTriggerAdapter
 
 SUBMISSION_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SUBMISSION_DIR.parent
@@ -22,62 +38,155 @@ logger = logging.getLogger("DoomAgent")
 
 
 class DoomAgent:
-    """Autonomous DOOM agent integrating perception, recurrent memory, and neural policy."""
+    """Autonomous DOOM agent integrating perception, recurrent memory, and neural policy.
 
-    def __init__(self, observation_space, action_space, device: str):
-        """Called once per evaluation run.
+    Lifecycle:
+      __init__: Called ONCE per evaluation run. Loads weights if present.
+      reset: Called before EVERY map. Clears recurrent hidden state and spatial memory.
+      act: Called once per decision step (every 4 game ticks). Returns a MultiBinary(9) action.
+    """
 
-        Loads weights from WEIGHTS_DIR / 'model.pt' onto `device` ("cuda" or "cpu").
-        """
+    def __init__(self, observation_space, action_space, device: str = "cpu"):
+        """Called once per evaluation run."""
         self.observation_space = observation_space
         self.action_space = action_space
         self.device_str = device
+        self.device = device
         self.rng = np.random.default_rng(0)
-        self.model = None
+        self._rng = self.rng
         self.hx = None
+        self.model = None
 
-        try:
-            import torch
-            from network import DoomNetwork, NetworkConfig
+        # Member 2: Sensory pipeline & spatial memory (ObservationAdapter canonical pipeline)
+        self.adapter = ObservationAdapter(enable_depth=False)
+        self.bridge = self.adapter.bridge
+        self.action_adapter = ActionEdgeTriggerAdapter(enabled=False)
 
-            self.torch = torch
-            target_device = torch.device(
-                device if torch.cuda.is_available() and device == "cuda" else "cpu"
-            )
-            self.device = target_device
-            self.config = NetworkConfig()
-            self.model = DoomNetwork(self.config).to(self.device)
-            self.model.eval()
+        # Telemetry & fallback tracking
+        self._total_steps = 0
+        self._n_perception_fallbacks = 0
+        self._n_network_fallbacks = 0
+        self._last_error: Optional[str] = None
 
-            weights_path = WEIGHTS_DIR / "model.pt"
-            if weights_path.is_file():
-                state_dict = torch.load(weights_path, map_location=self.device)
-                self.model.load_state_dict(state_dict)
-                logger.info("Loaded model weights from %s", weights_path)
-            else:
-                logger.info("No checkpoint found at %s; using initialized model weights.", weights_path)
-
-        except Exception as e:
-            logger.warning("Neural network initialization deferred: %s", e)
-            self.model = None
+        # Member 1 & 3: Model and weights loading
+        self._load_model(device)
 
     def reset(self) -> None:
         """Called before every map. Clear recurrent state, memory buffers and trackers."""
         self.hx = None
+        if self.bridge is not None:
+            self.bridge.reset()
+        if self.action_adapter is not None:
+            self.action_adapter.reset()
+        self._n_perception_fallbacks = 0
+        self._n_network_fallbacks = 0
+        self._last_error = None
+        logger.debug("DoomAgent.reset() completed.")
 
     def act(self, observation: dict) -> np.ndarray:
-        """Return a MultiBinary action: int array of shape action_space.shape with values in {0, 1}."""
+        """Process observation and return a 9-bit MultiBinary action: int8 array of shape (9,)."""
+        self._total_steps += 1
+
+        # --- Step 1: Member 2 Perception + Spatial Memory ---
+        if self.bridge is not None:
+            try:
+                enriched = self.bridge.process(observation)
+            except (ValueError, KeyError, AttributeError, TypeError) as exc:
+                self._n_perception_fallbacks += 1
+                self._last_error = f"perception: {exc}"
+                logger.error(
+                    "PerceptionBridge.process() failed (fallback #%d): %s",
+                    self._n_perception_fallbacks,
+                    exc,
+                )
+                return self._random_action()
+        else:
+            enriched = observation
+
+        # --- Step 2: Member 3 Neural Network Inference ---
         if self.model is not None:
             try:
-                with self.torch.no_grad():
+                import torch
+                with torch.no_grad():
                     action_np, self.hx = self.model.get_action(
-                        obs=observation,
+                        enriched,
                         hx=self.hx,
                         deterministic=True,
                     )
-                return action_np
-            except Exception as e:
-                logger.error("Error during model inference: %s", e)
+                if self.action_adapter is not None:
+                    action_np = self.action_adapter.process(action_np)
+                return action_np.astype(np.int8)
+            except Exception as exc:
+                self._n_network_fallbacks += 1
+                self._last_error = f"network: {exc}"
+                logger.error(
+                    "DoomNetwork.get_action() failed (fallback #%d): %s",
+                    self._n_network_fallbacks,
+                    exc,
+                )
+                return self._random_action()
 
-        # Compliant fallback action
-        return self.rng.integers(0, 2, size=self.action_space.shape, dtype=np.int8)
+        # --- Fallback: random compliant action ---
+        return self._random_action()
+
+    def _load_model(self, device: str) -> None:
+        """Attempt to load trained weights for DoomNetwork.
+
+        If no weights checkpoint is found, self.model remains None and the agent
+        falls back to random compliant actions (as verified by integration tests).
+        """
+        weights_path = WEIGHTS_DIR / "model.pt"
+        if not weights_path.is_file():
+            weights_path = WEIGHTS_DIR / "doom_network.pt"
+
+        if not weights_path.is_file():
+            logger.info("No weights found at %s. Agent running in baseline mode.", weights_path)
+            self.model = None
+            return
+
+        try:
+            import torch
+            from network.model import DoomNetwork
+            from network.config import NetworkConfig
+
+            target_device = torch.device(
+                device if torch.cuda.is_available() and device == "cuda" else "cpu"
+            )
+            self.device = target_device
+            config = NetworkConfig()
+            self.model = DoomNetwork(config=config)
+            try:
+                state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
+            except TypeError:
+                state_dict = torch.load(weights_path, map_location=self.device)
+            self.model.load_state_dict(state_dict)
+            self.model.to(self.device)
+            self.model.eval()
+            logger.info("DoomNetwork loaded from %s onto %s.", weights_path, self.device)
+        except Exception as exc:
+            logger.error("Failed to load DoomNetwork: %s. Falling back to random actions.", exc)
+            self.model = None
+
+    @property
+    def n_perception_fallbacks(self) -> int:
+        """Number of times perception failed and agent fell back to random."""
+        return self._n_perception_fallbacks
+
+    @property
+    def n_network_fallbacks(self) -> int:
+        """Number of times network inference failed and agent fell back to random."""
+        return self._n_network_fallbacks
+
+    @property
+    def last_error(self) -> Optional[str]:
+        """Last error message from perception or network failure. None if no failure."""
+        return self._last_error
+
+    @property
+    def total_steps(self) -> int:
+        """Total act() calls across all episodes."""
+        return self._total_steps
+
+    def _random_action(self) -> np.ndarray:
+        """Return a random MultiBinary(9) action."""
+        return self._rng.integers(0, 2, size=self.action_space.shape, dtype=np.int8)

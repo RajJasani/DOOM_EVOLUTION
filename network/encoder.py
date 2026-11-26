@@ -72,13 +72,15 @@ class VitalsEncoder(nn.Module):
         norm_vitals[..., 14:17] = norm_vitals[..., 14:17] / 20.0
         return norm_vitals
 
-    def forward(self, vitals: torch.Tensor) -> torch.Tensor:
+    def forward(self, vitals: torch.Tensor, normalize: bool | None = None) -> torch.Tensor:
         """Args:
             vitals: Tensor of shape (..., 17)
+            normalize: Optional override. If None, uses config.normalize_vitals.
         Returns:
             Tensor of shape (..., vitals_hidden_dim)
         """
-        normed = self.normalize_vitals(vitals)
+        should_normalize = normalize if normalize is not None else getattr(self.config, "normalize_vitals", False)
+        normed = self.normalize_vitals(vitals) if should_normalize else vitals
         return self.net(normed)
 
 
@@ -152,8 +154,39 @@ class RaycastEncoder(nn.Module):
         return out
 
 
+class MemoryEncoder(nn.Module):
+    """Encodes the 64-dimensional spatial memory vector from PerceptionBridge.
+
+    Projects doors, keys, threats, and direction exploration summaries into
+    a compact latent embedding for feature fusion.
+    """
+
+    def __init__(self, config: NetworkConfig):
+        super().__init__()
+        self.config = config
+        in_dim = config.memory_feature_dim
+        hidden_dim = config.memory_hidden_dim
+
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if config.use_layer_norm else nn.Identity(),
+            get_activation(config.activation),
+            nn.Linear(hidden_dim, hidden_dim),
+            nn.LayerNorm(hidden_dim) if config.use_layer_norm else nn.Identity(),
+            get_activation(config.activation),
+        )
+
+    def forward(self, memory: torch.Tensor) -> torch.Tensor:
+        """Args:
+            memory: Tensor of shape (..., memory_feature_dim)
+        Returns:
+            Tensor of shape (..., memory_hidden_dim)
+        """
+        return self.net(memory)
+
+
 class FeatureFusion(nn.Module):
-    """Combines player vitals, spatial raycast, enemy attention, and optional visual representations.
+    """Combines player vitals, spatial raycast, enemy attention, spatial memory, and optional visual representations.
 
     Produces a unified feature embedding for the recurrent memory.
     """
@@ -163,6 +196,8 @@ class FeatureFusion(nn.Module):
         self.config = config
 
         in_dim = config.vitals_hidden_dim + config.ray_hidden_dim + config.attention_embed_dim
+        if config.memory_feature_dim > 0:
+            in_dim += config.memory_hidden_dim
         if config.visual_feature_dim > 0:
             in_dim += config.visual_feature_dim
 
@@ -182,17 +217,33 @@ class FeatureFusion(nn.Module):
         vitals_emb: torch.Tensor,
         ray_emb: torch.Tensor,
         enemy_emb: torch.Tensor,
+        memory_emb: torch.Tensor | None = None,
         visual_emb: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Args:
             vitals_emb: (..., vitals_hidden_dim)
             ray_emb: (..., ray_hidden_dim)
             enemy_emb: (..., attention_embed_dim)
+            memory_emb: (..., memory_hidden_dim) optional
             visual_emb: (..., visual_feature_dim) optional
         Returns:
             (..., fusion_hidden_dim)
         """
         feats = [vitals_emb, ray_emb, enemy_emb]
+        if self.config.memory_feature_dim > 0:
+            if memory_emb is not None:
+                feats.append(memory_emb)
+            else:
+                # Robust fallback if memory_emb is omitted: zero tensor matching batch shape
+                leading_shape = vitals_emb.shape[:-1]
+                zeros_mem = torch.zeros(
+                    *leading_shape,
+                    self.config.memory_hidden_dim,
+                    dtype=vitals_emb.dtype,
+                    device=vitals_emb.device,
+                )
+                feats.append(zeros_mem)
+
         if visual_emb is not None and self.config.visual_feature_dim > 0:
             feats.append(visual_emb)
         combined = torch.cat(feats, dim=-1)
