@@ -398,3 +398,147 @@ def test_live_doom_env_episode():
     assert steps_taken == 25
     assert hx.shape == (1, 1, 256)
     env.close()
+
+
+# ==============================================================================
+# Regression Tests: Unbatched, Batched & Sequential Dimension Normalization
+# ==============================================================================
+def test_unbatched_encode_observation_regression():
+    """Verify encode_observation handles unbatched inputs without tensor dimension mismatch."""
+    model = DoomNetwork()
+
+    # 1. Synthetic unbatched observation (PyTorch tensors)
+    synth_obs = create_synthetic_observation()
+    assert synth_obs["vitals"].ndim == 1
+    fused_synth = model.encode_observation(synth_obs)
+    assert fused_synth.shape == (1, model.config.fusion_hidden_dim)
+    assert not torch.isnan(fused_synth).any()
+
+    # 2. Official Gymnasium sample observation (NumPy ndarrays)
+    gym_obs = S.observation_space().sample()
+    assert gym_obs["vitals"].ndim == 1
+    fused_gym = model.encode_observation(gym_obs)
+    assert fused_gym.shape == (1, model.config.fusion_hidden_dim)
+    assert not torch.isnan(fused_gym).any()
+
+
+def test_unbatched_get_value_regression():
+    """Verify get_value handles unbatched inputs and returns a critic scalar/tensor cleanly."""
+    model = DoomNetwork()
+
+    # 1. Synthetic unbatched observation
+    synth_obs = create_synthetic_observation()
+    val_synth = model.get_value(synth_obs)
+    assert val_synth.shape == (1, 1)
+    assert not torch.isnan(val_synth).any()
+
+    # 2. Gymnasium sample observation
+    gym_obs = S.observation_space().sample()
+    val_gym = model.get_value(gym_obs)
+    assert val_gym.shape == (1, 1)
+    assert not torch.isnan(val_gym).any()
+
+
+def test_unbatched_forward_regression():
+    """Verify forward() accepts unbatched observations and outputs correctly shaped tensors."""
+    model = DoomNetwork()
+
+    # 1. Synthetic unbatched observation
+    synth_obs = create_synthetic_observation()
+    logits, values, next_hx = model(synth_obs)
+    assert logits.shape == (1, 9)
+    assert values.shape == (1, 1)
+    assert next_hx.shape == (1, 1, 256)
+    assert not torch.isnan(logits).any()
+    assert not torch.isnan(values).any()
+
+    # 2. Gymnasium sample observation
+    gym_obs = S.observation_space().sample()
+    logits_g, values_g, next_hx_g = model(gym_obs)
+    assert logits_g.shape == (1, 9)
+    assert values_g.shape == (1, 1)
+    assert next_hx_g.shape == (1, 1, 256)
+    assert not torch.isnan(logits_g).any()
+    assert not torch.isnan(values_g).any()
+
+
+def test_unbatched_step_regression():
+    """Verify step() continues to produce unbatched action (9,), value (1,), and scalar log_prob."""
+    model = DoomNetwork()
+
+    # 1. Synthetic unbatched observation
+    synth_obs = create_synthetic_observation()
+    res_synth = model.step(synth_obs, hx=None, deterministic=False)
+    assert res_synth.action.shape == (9,)
+    assert res_synth.value.shape == (1,)
+    assert res_synth.log_prob.shape == ()
+    assert res_synth.logits.shape == (9,)
+    assert res_synth.hx.shape == (1, 1, 256)
+
+    # 2. Gymnasium sample observation
+    gym_obs = S.observation_space().sample()
+    res_gym = model.step(gym_obs, hx=None, deterministic=True)
+    assert res_gym.action.shape == (9,)
+    assert res_gym.value.shape == (1,)
+    assert res_gym.log_prob.shape == ()
+    assert res_gym.logits.shape == (9,)
+    assert res_gym.hx.shape == (1, 1, 256)
+
+
+def test_batched_observations_regression():
+    """Verify batched inputs preserve full batch dimension across all public methods."""
+    model = DoomNetwork()
+    batch_size = 4
+    batch_obs = create_synthetic_observation(batch_size=batch_size)
+
+    # encode_observation
+    fused = model.encode_observation(batch_obs)
+    assert fused.shape == (batch_size, model.config.fusion_hidden_dim)
+
+    # forward
+    logits, values, next_hx = model(batch_obs)
+    assert logits.shape == (batch_size, 9)
+    assert values.shape == (batch_size, 1)
+    assert next_hx.shape == (1, batch_size, 256)
+
+    # get_value
+    val = model.get_value(batch_obs)
+    assert val.shape == (batch_size, 1)
+
+    # step
+    step_res = model.step(batch_obs)
+    assert step_res.action.shape == (batch_size, 9)
+    assert step_res.value.shape == (batch_size, 1)
+    assert step_res.log_prob.shape == (batch_size,)
+    assert step_res.logits.shape == (batch_size, 9)
+    assert step_res.hx.shape == (1, batch_size, 256)
+
+
+def test_sequential_observations_regression():
+    """Verify sequential inputs preserve (B, T, ...) shapes across forward and evaluation."""
+    model = DoomNetwork()
+    batch_size = 3
+    seq_len = 6
+    seq_obs = create_synthetic_observation(batch_size=batch_size, seq_len=seq_len)
+
+    # encode_observation
+    fused = model.encode_observation(seq_obs)
+    assert fused.shape == (batch_size, seq_len, model.config.fusion_hidden_dim)
+
+    # forward
+    logits, values, next_hx = model(seq_obs)
+    assert logits.shape == (batch_size, seq_len, 9)
+    assert values.shape == (batch_size, seq_len, 1)
+    assert next_hx.shape == (1, batch_size, 256)
+
+    # get_value
+    val = model.get_value(seq_obs)
+    assert val.shape == (batch_size, seq_len, 1)
+
+    # evaluate_actions
+    actions = torch.randint(0, 2, (batch_size, seq_len, 9)).float()
+    eval_res = model.evaluate_actions(seq_obs, hx=None, actions=actions)
+    assert eval_res.values.shape == (batch_size, seq_len, 1)
+    assert eval_res.log_probs.shape == (batch_size, seq_len)
+    assert eval_res.entropy.shape == (batch_size, seq_len)
+    assert eval_res.hx.shape == (1, batch_size, 256)

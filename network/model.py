@@ -86,7 +86,12 @@ class DoomNetwork(nn.Module):
             raise TypeError(f"Cannot convert {type(val)} to tensor.")
 
     def _extract_inputs(self, obs: Mapping[str, Any]) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-        """Extract and prepare all required observation tensors."""
+        """Extract and prepare all required observation tensors.
+
+        Normalizes unbatched observation inputs by prepending a batch dimension (B=1)
+        so downstream feature encoders, enemy attention, and feature fusion
+        receive consistent tensor ranks.
+        """
         # Vitals: (..., 17)
         vitals = self._prepare_tensor(obs["vitals"], dtype=torch.float32)
 
@@ -105,6 +110,22 @@ class DoomNetwork(nn.Module):
         visual = None
         if "visual_embedding" in obs and self.config.visual_feature_dim > 0:
             visual = self._prepare_tensor(obs["visual_embedding"], dtype=torch.float32)
+
+        # Prepend batch dimension if input tensors are unbatched
+        if vitals.ndim == 1:
+            vitals = vitals.unsqueeze(0)
+        if ray_dist.ndim == 1:
+            ray_dist = ray_dist.unsqueeze(0)
+        if ray_hit.ndim == 1:
+            ray_hit = ray_hit.unsqueeze(0)
+        if ent_feats.ndim == 2:
+            ent_feats = ent_feats.unsqueeze(0)
+        if ent_type.ndim == 1:
+            ent_type = ent_type.unsqueeze(0)
+        if ent_mask.ndim == 1:
+            ent_mask = ent_mask.unsqueeze(0)
+        if visual is not None and visual.ndim in (1, 3):
+            visual = visual.unsqueeze(0)
 
         return vitals, ray_dist, ray_hit, ent_feats, ent_type, ent_mask, visual
 
@@ -175,26 +196,13 @@ class DoomNetwork(nn.Module):
         Returns:
             StepResult namedtuple: (action, value, log_prob, hx, logits)
         """
-        # Ensure batch dimension exists if unbatched observation is passed
-        is_unbatched = False
+        # Determine if input was unbatched to format outputs accordingly
         vitals_val = obs["vitals"]
-        if (isinstance(vitals_val, np.ndarray) and vitals_val.ndim == 1) or (
-            isinstance(vitals_val, torch.Tensor) and vitals_val.ndim == 1
-        ):
-            is_unbatched = True
-            # Wrap observation fields with batch dim 1
-            obs = {
-                "vitals": np.expand_dims(obs["vitals"], 0) if isinstance(obs["vitals"], np.ndarray) else obs["vitals"].unsqueeze(0),
-                "rays": {
-                    "distance": np.expand_dims(obs["rays"]["distance"], 0) if isinstance(obs["rays"]["distance"], np.ndarray) else obs["rays"]["distance"].unsqueeze(0),
-                    "hit_type": np.expand_dims(obs["rays"]["hit_type"], 0) if isinstance(obs["rays"]["hit_type"], np.ndarray) else obs["rays"]["hit_type"].unsqueeze(0),
-                },
-                "visible_entities": {
-                    "features": np.expand_dims(obs["visible_entities"]["features"], 0) if isinstance(obs["visible_entities"]["features"], np.ndarray) else obs["visible_entities"]["features"].unsqueeze(0),
-                    "entity_type": np.expand_dims(obs["visible_entities"]["entity_type"], 0) if isinstance(obs["visible_entities"]["entity_type"], np.ndarray) else obs["visible_entities"]["entity_type"].unsqueeze(0),
-                    "mask": np.expand_dims(obs["visible_entities"]["mask"], 0) if isinstance(obs["visible_entities"]["mask"], np.ndarray) else obs["visible_entities"]["mask"].unsqueeze(0),
-                },
-            }
+        is_unbatched = False
+        if isinstance(vitals_val, (np.ndarray, torch.Tensor)):
+            is_unbatched = (vitals_val.ndim == 1)
+        elif isinstance(vitals_val, (list, tuple)):
+            is_unbatched = (len(vitals_val) == 0 or not isinstance(vitals_val[0], (list, tuple, np.ndarray, torch.Tensor)))
 
         logits, value, next_hx = self.forward(obs, hx=hx)
         action, log_prob = self.actor.sample_action(logits, deterministic=deterministic)
