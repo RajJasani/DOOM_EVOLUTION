@@ -74,6 +74,10 @@ def test_cpu_and_ram_limits_are_emulated(tmp_path):
     """The agent runs on one core with single-threaded numeric libraries, and its RAM is measured."""
     import os
     import re
+    import pytest
+
+    if not hasattr(os, "sched_getaffinity"):
+        pytest.skip("sched_getaffinity is Linux-only")
 
     src = (
         "import os\nimport numpy as np\n"

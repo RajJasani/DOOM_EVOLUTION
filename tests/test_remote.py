@@ -187,6 +187,11 @@ def test_hostile_replies_become_protocol_failures(name):
     import resource
     import socket
     host, agent = socket.socketpair()
+    try:
+        host.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 256 * 1024)
+        agent.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 256 * 1024)
+    except OSError:
+        pass
     conn = remote.AgentConnection(host)
     agent.sendall(_raw(HOSTILE[name]))  # pre-sent before the request even arrives
     before = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
