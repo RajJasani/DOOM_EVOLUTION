@@ -135,12 +135,22 @@ class DoomAgent:
         If no weights checkpoint is found, self.model remains None and the agent
         falls back to random compliant actions (as verified by integration tests).
         """
-        weights_path = WEIGHTS_DIR / "model.pt"
-        if not weights_path.is_file():
-            weights_path = WEIGHTS_DIR / "doom_network.pt"
+        candidate_paths = [
+            WEIGHTS_DIR / "model.pt",
+            WEIGHTS_DIR / "emergency_beginner" / "starting_model.pt",
+            WEIGHTS_DIR / "emergency_beginner" / "emergency_beginner_best_navigation.pt",
+            WEIGHTS_DIR / "curriculum_phase5_2" / "best_curriculum_model.pt",
+            WEIGHTS_DIR / "best_model.pt",
+            WEIGHTS_DIR / "doom_network.pt",
+        ]
+        weights_path = None
+        for p in candidate_paths:
+            if p.is_file():
+                weights_path = p
+                break
 
-        if not weights_path.is_file():
-            logger.info("No weights found at %s. Agent running in baseline mode.", weights_path)
+        if weights_path is None:
+            logger.info("No weights found in %s. Agent running in baseline mode.", WEIGHTS_DIR)
             self.model = None
             return
 
@@ -153,16 +163,33 @@ class DoomAgent:
                 device if torch.cuda.is_available() and device == "cuda" else "cpu"
             )
             self.device = target_device
-            config = NetworkConfig()
-            self.model = DoomNetwork(config=config)
             try:
-                state_dict = torch.load(weights_path, map_location=self.device, weights_only=True)
+                raw_checkpoint = torch.load(weights_path, map_location=self.device, weights_only=True)
             except TypeError:
-                state_dict = torch.load(weights_path, map_location=self.device)
+                raw_checkpoint = torch.load(weights_path, map_location=self.device)
+
+            if isinstance(raw_checkpoint, dict) and "model_state_dict" in raw_checkpoint:
+                state_dict = raw_checkpoint["model_state_dict"]
+            else:
+                state_dict = raw_checkpoint
+
+            # Detect whether checkpoint was trained with memory encoder (64-dim) or raw 1.19M baseline (0-dim)
+            has_memory = (
+                "memory_encoder.net.0.weight" in state_dict
+                or (
+                    "fusion.fusion_mlp.0.weight" in state_dict
+                    and state_dict["fusion.fusion_mlp.0.weight"].shape[1] == 320
+                )
+            )
+            config = NetworkConfig(
+                memory_feature_dim=64 if has_memory else 0,
+                normalize_vitals=False,  # PerceptionBridge normalizes vitals to [0, 1]
+            )
+            self.model = DoomNetwork(config=config)
             self.model.load_state_dict(state_dict)
             self.model.to(self.device)
             self.model.eval()
-            logger.info("DoomNetwork loaded from %s onto %s.", weights_path, self.device)
+            logger.info("DoomNetwork loaded from %s onto %s (memory_dim=%d).", weights_path, self.device, config.memory_feature_dim)
         except Exception as exc:
             logger.error("Failed to load DoomNetwork: %s. Falling back to random actions.", exc)
             self.model = None
