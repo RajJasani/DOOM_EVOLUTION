@@ -182,18 +182,31 @@ class DoomNetwork(nn.Module):
             isinstance(vitals_val, torch.Tensor) and vitals_val.ndim == 1
         ):
             is_unbatched = True
-            # Wrap observation fields with batch dim 1
+
+            def _expand(v):
+                """Add a leading batch dimension of 1 to a numpy array or tensor."""
+                if isinstance(v, np.ndarray):
+                    return np.expand_dims(v, 0)
+                return v.unsqueeze(0)
+
+            # Wrap the three structured observation fields with batch dim 1.
+            # All additional keys (e.g. "visual_embedding" from Member 2's perception
+            # module, or "rgb"/"depth") are forwarded unchanged — they already carry
+            # the correct shape because _extract_inputs() handles them directly.
             obs = {
-                "vitals": np.expand_dims(obs["vitals"], 0) if isinstance(obs["vitals"], np.ndarray) else obs["vitals"].unsqueeze(0),
+                "vitals": _expand(obs["vitals"]),
                 "rays": {
-                    "distance": np.expand_dims(obs["rays"]["distance"], 0) if isinstance(obs["rays"]["distance"], np.ndarray) else obs["rays"]["distance"].unsqueeze(0),
-                    "hit_type": np.expand_dims(obs["rays"]["hit_type"], 0) if isinstance(obs["rays"]["hit_type"], np.ndarray) else obs["rays"]["hit_type"].unsqueeze(0),
+                    "distance": _expand(obs["rays"]["distance"]),
+                    "hit_type": _expand(obs["rays"]["hit_type"]),
                 },
                 "visible_entities": {
-                    "features": np.expand_dims(obs["visible_entities"]["features"], 0) if isinstance(obs["visible_entities"]["features"], np.ndarray) else obs["visible_entities"]["features"].unsqueeze(0),
-                    "entity_type": np.expand_dims(obs["visible_entities"]["entity_type"], 0) if isinstance(obs["visible_entities"]["entity_type"], np.ndarray) else obs["visible_entities"]["entity_type"].unsqueeze(0),
-                    "mask": np.expand_dims(obs["visible_entities"]["mask"], 0) if isinstance(obs["visible_entities"]["mask"], np.ndarray) else obs["visible_entities"]["mask"].unsqueeze(0),
+                    "features": _expand(obs["visible_entities"]["features"]),
+                    "entity_type": _expand(obs["visible_entities"]["entity_type"]),
+                    "mask": _expand(obs["visible_entities"]["mask"]),
                 },
+                # Forward every extra key (visual_embedding, rgb, depth, …) unchanged.
+                **{k: v for k, v in obs.items()
+                   if k not in ("vitals", "rays", "visible_entities")},
             }
 
         logits, value, next_hx = self.forward(obs, hx=hx)
